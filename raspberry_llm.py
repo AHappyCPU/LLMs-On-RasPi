@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+import re
 
 # --- Configuration and Model Definition ---
 
@@ -128,12 +129,77 @@ class WeightLoader:
         
         # Dequantize to float32
         return (result.astype(np.float32) - zero_point) * scale
+
+
+class Tokenizer:
+    """Simple BPE-like tokenizer implementation"""
     
+    def __init__(self, vocab_path: str):
+        self.load_vocabulary(vocab_path)
+        # Sort tokens by length (longest first) to handle merges properly
+        self.tokens_by_length = sorted(
+            [(token, idx) for token, idx in self.vocab.items()],
+            key=lambda x: len(x[0]), reverse=True
+        )
+        # Add a special token for unknown tokens
+        self.unk_token_id = self.vocab.get("<unk>", 0)
+    
+    def load_vocabulary(self, vocab_path: str):
+        """Load tokenizer vocabulary"""
+        if os.path.exists(vocab_path):
+            with open(vocab_path, 'r') as f:
+                self.vocab = json.load(f)
+                self.id_to_token = {int(v): k for k, v in self.vocab.items()}
+        else:
+            print(f"Warning: Vocabulary file not found at {vocab_path}")
+            self.vocab = {}
+            self.id_to_token = {}
+    
+    def encode(self, text: str, max_length: int = 512) -> torch.Tensor:
+        """Encode text into token IDs using a greedy BPE-like algorithm"""
+        if not text:
+            return torch.tensor([[]], dtype=torch.long)
+        
+        # Normalize text by replacing multiple spaces with a single space
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Initialize with characters as tokens
+        tokens = []
+        remaining_text = text
+        
+        # Greedy tokenization
+        while remaining_text:
+            matched = False
+            
+            # Try to match the longest tokens first
+            for token, token_id in self.tokens_by_length:
+                if remaining_text.startswith(token):
+                    tokens.append(token_id)
+                    remaining_text = remaining_text[len(token):]
+                    matched = True
+                    break
+            
+            # If no match found, move forward by one character
+            if not matched:
+                tokens.append(self.unk_token_id)
+                remaining_text = remaining_text[1:]
+        
+        # Truncate to max_length
+        if len(tokens) > max_length:
+            tokens = tokens[:max_length]
+        
+        # Return as tensor with batch dimension
+        return torch.tensor([tokens], dtype=torch.long)
+    
+    def decode(self, token_ids: List[int]) -> str:
+        """Convert token IDs back to text"""
+        return ''.join([self.id_to_token.get(id, "") for id in token_ids])
+
 
 class RaspberryLLM:
     """Memory-efficient LLM implementation for Raspberry Pi"""
     
-    def __init__(self, model_dir: str, quantization_bits: int = 4, sliding_window: int = 2):
+    def __init__(self, model_dir: str, quantization_bits: int = 8, sliding_window: int = 3):
         self.model_dir = model_dir
         self.quantization_bits = quantization_bits
         self.sliding_window = sliding_window
@@ -149,11 +215,9 @@ class RaspberryLLM:
         self.loaded_layers = set()
         self.cached_weights = {}
         
-        # KV cache for efficient generation
-        self.kv_cache = None
-        
-        # Load vocabulary (for tokenization/detokenization)
-        self.load_vocabulary()
+        # Initialize tokenizer
+        vocab_path = os.path.join(model_dir, "vocab.json")
+        self.tokenizer = Tokenizer(vocab_path)
         
         # Load embeddings (these stay in memory permanently)
         print("Loading embeddings...")
@@ -166,18 +230,9 @@ class RaspberryLLM:
             (self.config.max_position_embeddings, self.config.hidden_size)
         )
         print("Embeddings loaded")
-    
-    def load_vocabulary(self):
-        """Load tokenizer vocabulary"""
-        vocab_path = os.path.join(self.model_dir, "vocab.json")
-        if os.path.exists(vocab_path):
-            with open(vocab_path, 'r') as f:
-                self.vocab = json.load(f)
-                self.id_to_token = {int(v): k for k, v in self.vocab.items()}
-        else:
-            print("Warning: Vocabulary file not found")
-            self.vocab = {}
-            self.id_to_token = {}
+        
+        # Initialize KV cache
+        self.kv_cache = None
     
     def load_component(self, component_name: str, shape: Tuple[int, ...]) -> torch.Tensor:
         """Load a model component with specific shape"""
@@ -223,6 +278,10 @@ class RaspberryLLM:
         if layer_idx not in self.loaded_layers:
             return  # Not loaded
         
+        # Only unload if we have more than sliding_window layers loaded
+        if len(self.loaded_layers) <= self.sliding_window:
+            return
+        
         print(f"Unloading layer {layer_idx}...")
         
         # Remove all weights associated with this layer
@@ -255,7 +314,7 @@ class RaspberryLLM:
         
         # Get dimensions for debugging
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        print(f"Input hidden states shape: {hidden_states.shape}")
+        head_size = hidden_dim // self.config.num_attention_heads
         
         # 1. Self-attention
         # Query, Key, Value projections
@@ -263,31 +322,23 @@ class RaspberryLLM:
         k_weight = self.cached_weights[f"layer.{layer_idx}.attention.self.key.weight"]
         v_weight = self.cached_weights[f"layer.{layer_idx}.attention.self.value.weight"]
         
-        print(f"Query weight shape: {q_weight.shape}")
+        # Reshape hidden states for matrix multiplication
+        hidden_states_2d = hidden_states.reshape(-1, hidden_dim)
         
-        # Check dimension compatibility
-        if hidden_dim != q_weight.shape[1]:
-            raise ValueError(f"Hidden dim {hidden_dim} doesn't match weight dim {q_weight.shape[1]}")
-        
-        # Reshape hidden states for matrix multiplication if needed
-        hidden_states_2d = hidden_states.view(-1, hidden_dim)  # Combine batch and seq dims
-        
-        # Compute query, key, value projections with proper reshaping
-        query = torch.matmul(hidden_states_2d, q_weight.t()).view(batch_size, seq_len, -1)
-        key = torch.matmul(hidden_states_2d, k_weight.t()).view(batch_size, seq_len, -1)
-        value = torch.matmul(hidden_states_2d, v_weight.t()).view(batch_size, seq_len, -1)
+        # Compute query, key, value projections
+        query = torch.matmul(hidden_states_2d, q_weight.t()).reshape(batch_size, seq_len, hidden_dim)
+        key = torch.matmul(hidden_states_2d, k_weight.t()).reshape(batch_size, seq_len, hidden_dim)
+        value = torch.matmul(hidden_states_2d, v_weight.t()).reshape(batch_size, seq_len, hidden_dim)
         
         # Reshape for attention computation
-        head_size = self.config.hidden_size // self.config.num_attention_heads
-        
-        query = query.view(batch_size, seq_len, self.config.num_attention_heads, head_size)
-        key = key.view(batch_size, seq_len, self.config.num_attention_heads, head_size)
-        value = value.view(batch_size, seq_len, self.config.num_attention_heads, head_size)
+        query = query.reshape(batch_size, seq_len, self.config.num_attention_heads, head_size)
+        key = key.reshape(batch_size, seq_len, self.config.num_attention_heads, head_size)
+        value = value.reshape(batch_size, seq_len, self.config.num_attention_heads, head_size)
         
         # Transpose for batch matrix multiplication
-        query = query.transpose(1, 2)  # (batch, heads, seq, head_size)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        query = query.permute(0, 2, 1, 3)  # (batch, heads, seq, head_size)
+        key = key.permute(0, 2, 1, 3)
+        value = value.permute(0, 2, 1, 3)
         
         # Attention scores and weights
         attention_scores = torch.matmul(query, key.transpose(2, 3))
@@ -296,14 +347,14 @@ class RaspberryLLM:
         
         # Apply attention to values
         context = torch.matmul(attention_weights, value)
-        context = context.transpose(1, 2).contiguous()  # (batch, seq, heads, head_size)
-        context = context.view(batch_size, seq_len, self.config.hidden_size)
+        context = context.permute(0, 2, 1, 3).contiguous()  # (batch, seq, heads, head_size)
+        context = context.reshape(batch_size, seq_len, hidden_dim)
         
         # Self-attention output projection
         attention_output = torch.matmul(
-            context, 
+            context.reshape(-1, hidden_dim), 
             self.cached_weights[f"layer.{layer_idx}.attention.output.dense.weight"].t()
-        )
+        ).reshape(batch_size, seq_len, hidden_dim)
         
         # First residual connection and layer norm
         attention_output = attention_output + hidden_states
@@ -316,9 +367,9 @@ class RaspberryLLM:
         
         # Feed-forward network
         intermediate = torch.matmul(
-            attention_output.view(-1, hidden_dim), 
+            attention_output.reshape(-1, hidden_dim), 
             self.cached_weights[f"layer.{layer_idx}.intermediate.dense.weight"].t()
-        ).view(batch_size, seq_len, -1)
+        ).reshape(batch_size, seq_len, -1)
         
         intermediate = intermediate + self.cached_weights[f"layer.{layer_idx}.intermediate.dense.bias"]
         
@@ -329,9 +380,9 @@ class RaspberryLLM:
         
         # Output projection
         layer_output = torch.matmul(
-            intermediate.view(-1, self.config.intermediate_size), 
+            intermediate.reshape(-1, self.config.intermediate_size), 
             self.cached_weights[f"layer.{layer_idx}.output.dense.weight"].t()
-        ).view(batch_size, seq_len, hidden_dim)
+        ).reshape(batch_size, seq_len, hidden_dim)
         
         layer_output = layer_output + self.cached_weights[f"layer.{layer_idx}.output.dense.bias"]
         
@@ -350,13 +401,13 @@ class RaspberryLLM:
         """Convert input token IDs to embeddings"""
         batch_size, seq_len = input_ids.shape
         
-        # Token embeddings via lookup
+        # Token embeddings
         inputs_embeds = torch.zeros(
             (batch_size, seq_len, self.config.hidden_size), 
             dtype=torch.float32
         )
         
-        # Manual embedding lookup to avoid large one-hot matrices
+        # Manual embedding lookup (more memory efficient)
         for b in range(batch_size):
             for s in range(seq_len):
                 token_id = input_ids[b, s].item()
@@ -365,44 +416,64 @@ class RaspberryLLM:
         
         # Add position embeddings
         position_ids = torch.arange(seq_len, dtype=torch.long)
+        # Handle positions beyond max_position_embeddings with modulo
+        position_ids = position_ids % self.config.max_position_embeddings
         position_embeds = self.position_embeddings[position_ids]
         
-        # Combine embeddings (broadcasting position embeds to all batches)
+        # Combine embeddings
         return inputs_embeds + position_embeds.unsqueeze(0)
     
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 20, 
-                temperature: float = 0.8, repetition_penalty: float = 1.3, 
-                top_k: int = 40) -> torch.Tensor:
-        """Generate text auto-regressively with sliding window of loaded layers"""
-        print(f"Generating {max_new_tokens} tokens...")
+    def initialize_kv_cache(self, batch_size: int):
+        """Initialize key-value cache for generation"""
+        head_size = self.config.hidden_size // self.config.num_attention_heads
         
+        self.kv_cache = [{
+            "key": torch.zeros(
+                batch_size, 
+                self.config.num_attention_heads, 
+                0,  # Initially empty
+                head_size
+            ),
+            "value": torch.zeros(
+                batch_size, 
+                self.config.num_attention_heads, 
+                0,  # Initially empty
+                head_size
+            )
+        } for _ in range(self.config.num_hidden_layers)]
+    
+    def generate(self, prompt: str, max_new_tokens: int = 20, 
+                temperature: float = 0.8, repetition_penalty: float = 1.3, 
+                top_k: int = 40) -> str:
+        """Generate text auto-regressively with sliding window of loaded layers"""
+        print(f"Generating {max_new_tokens} tokens from prompt: '{prompt}'")
+        
+        # Encode prompt using our improved tokenizer
+        input_ids = self.tokenizer.encode(prompt)
         batch_size, seq_len = input_ids.shape
         all_token_ids = input_ids.clone()
         
-        # Process input sequence
+        # Process full input sequence through all layers
         hidden_states = self.embed_input(input_ids)
         
-        # Make sure all layers are loaded initially
+        print(f"Initial sequence length: {seq_len}")
+        
+        # Initial full forward pass for context
         for layer_idx in range(self.config.num_hidden_layers):
             # Manage sliding window of loaded layers
-            if len(self.loaded_layers) > self.sliding_window + 1:
+            if len(self.loaded_layers) > self.sliding_window:
                 # Find oldest layer to unload
                 oldest_layer = min(self.loaded_layers)
                 self.unload_layer(oldest_layer)
-                
-            # Ensure this layer is loaded
-            if layer_idx not in self.loaded_layers:
-                self.load_layer(layer_idx)
             
             # Forward through layer
-            print(f"Processing layer {layer_idx} for input sequence...")
             hidden_states = self.forward_layer(layer_idx, hidden_states)
         
-        # Initialize KV cache for efficient generation
-        self.kv_cache = [{
-            "key": None,
-            "value": None
-        } for _ in range(self.config.num_hidden_layers)]
+        # Initialize KV cache for generation
+        self.initialize_kv_cache(batch_size)
+        
+        # Generated text buffer
+        generated_text = ""
         
         # Generate new tokens auto-regressively
         for i in range(max_new_tokens):
@@ -410,47 +481,43 @@ class RaspberryLLM:
             last_hidden = hidden_states[:, -1:, :]
             
             # Get logits by using the word embedding matrix transposed
-            # This avoids loading a separate LM head
             logits = torch.matmul(last_hidden, self.token_embeddings.t())
             logits = logits.squeeze(1)  # (batch, vocab_size)
             
             # Apply temperature to control randomness
-            logits = logits / temperature
+            logits = logits / max(0.1, temperature)  # Prevent division by zero
             
-            # Apply repetition penalty to reduce token repetition
+            # Apply repetition penalty
             if i > 0:
-                # Get previously generated tokens (up to last 10)
-                prev_tokens = all_token_ids[:, -10:] if all_token_ids.size(1) >= 10 else all_token_ids
-                # Apply penalty to previously generated tokens
-                for prev_token in prev_tokens.unique():
-                    token_idx = prev_token.item()
-                    # Reduce probability of previously generated tokens
-                    logits[:, token_idx] = logits[:, token_idx] / repetition_penalty
+                # Get previously generated tokens
+                prev_tokens = all_token_ids[:, -20:] if all_token_ids.size(1) >= 20 else all_token_ids
+                for b in range(batch_size):
+                    for token_idx in prev_tokens[b].unique():
+                        # Apply penalty (reducing probability of repeating tokens)
+                        logits[b, token_idx] = logits[b, token_idx] / repetition_penalty
             
-            # Print top token candidates for debugging
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            topk_probs, topk_indices = torch.topk(probs, k=min(5, probs.size(-1)))
-            print("\nTop 5 token candidates:")
-            for j, (prob, idx) in enumerate(zip(topk_probs[0], topk_indices[0])):
-                token = self.id_to_token.get(idx.item(), "[UNK]")
-                print(f"  {j+1}: '{token}' (prob: {prob.item():.4f})")
-            
-            # Apply top-k sampling to filter out unlikely tokens
+            # Apply top-k sampling
             if top_k > 0:
-                # Zero out all logits below the top k
-                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                logits[indices_to_remove] = float('-inf')
+                # Get top-k values and indices
+                top_k_values, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)))
+                
+                # Create a new logits tensor with -inf everywhere
+                new_logits = torch.full_like(logits, float('-inf'))
+                
+                # Copy the top-k values back 
+                for b in range(batch_size):
+                    new_logits[b, top_k_indices[b]] = top_k_values[b]
+                
+                logits = new_logits
             
-            # Sample from the distribution
+            # Sample from the filtered distribution
             probs = torch.nn.functional.softmax(logits, dim=-1)
             next_token_id = torch.multinomial(probs, num_samples=1)
             
-            # Print the generated token
-            if next_token_id.item() in self.id_to_token:
-                token_str = self.id_to_token[next_token_id.item()]
-                print(f"Generated token {i+1}/{max_new_tokens}: {token_str}")
-            else:
-                print(f"Generated token {i+1}/{max_new_tokens}: [UNKNOWN]")
+            # Print token details if verbose
+            token_str = self.tokenizer.decode([next_token_id.item()])
+            print(f"Generated token {i+1}/{max_new_tokens}: {token_str}")
+            generated_text += token_str
             
             # Add to output sequence
             all_token_ids = torch.cat([all_token_ids, next_token_id], dim=1)
@@ -458,99 +525,77 @@ class RaspberryLLM:
             # Get embedding for new token
             new_token_embed = self.embed_input(next_token_id)
             
-            # Append new token embedding to hidden states (for context)
-            hidden_states = torch.cat([hidden_states, new_token_embed], dim=1)
+            # Process just the new token through all layers with KV caching
+            token_hidden = new_token_embed
             
-            # Forward only the new token through all layers
-            # This is more efficient than re-computing the entire sequence
-            new_hidden = new_token_embed
-            
-            # Ensure all layers are loaded for processing the new token
+            # Process through all layers with KV cache
             for layer_idx in range(self.config.num_hidden_layers):
-                # Make sure this layer is loaded
+                # Ensure this layer is loaded
                 if layer_idx not in self.loaded_layers:
                     self.load_layer(layer_idx)
-                    
-                # Forward pass just for the new token, with KV caching
-                new_hidden = self.forward_layer_with_kv_cache(
-                    layer_idx, new_hidden, hidden_states, (seq_len + i)
-                )
+                
+                # Process token with cached context
+                token_hidden = self.forward_layer_with_kv_cache(layer_idx, token_hidden)
+                
+                # Manage sliding window of layers
+                if layer_idx >= self.sliding_window:
+                    layer_to_unload = layer_idx - self.sliding_window
+                    self.unload_layer(layer_to_unload)
             
-            # Update the last hidden state
-            hidden_states[:, -1:, :] = new_hidden
-            
-            # Unload layers to maintain the sliding window
-            if len(self.loaded_layers) > self.sliding_window:
-                # Find oldest layer to unload
-                oldest_layer = min(self.loaded_layers)
-                self.unload_layer(oldest_layer)
+            # Update hidden states with new token
+            hidden_states = torch.cat([hidden_states, token_hidden], dim=1)
         
         print("Generation complete")
-        return all_token_ids
+        return prompt + generated_text
     
-    def forward_layer_with_kv_cache(self, layer_idx: int, token_hidden: torch.Tensor,
-                                  context_hidden: torch.Tensor, position: int) -> torch.Tensor:
+    def forward_layer_with_kv_cache(self, layer_idx: int, token_hidden: torch.Tensor) -> torch.Tensor:
         """Forward pass with KV cache for efficient generation"""
-        # Make sure layer is loaded
+        # Ensure layer is loaded
         if layer_idx not in self.loaded_layers:
             self.load_layer(layer_idx)
         
-        batch_size = token_hidden.shape[0]
-        head_size = self.config.hidden_size // self.config.num_attention_heads
-        hidden_dim = self.config.hidden_size
+        batch_size, seq_len, hidden_dim = token_hidden.shape
+        assert seq_len == 1, "KV cache forward only works with single tokens"
         
-        # 1. Self-attention for the single token
-        # Query, Key, Value projections
+        head_size = hidden_dim // self.config.num_attention_heads
+        
+        # Get weights
         q_weight = self.cached_weights[f"layer.{layer_idx}.attention.self.query.weight"]
         k_weight = self.cached_weights[f"layer.{layer_idx}.attention.self.key.weight"]
         v_weight = self.cached_weights[f"layer.{layer_idx}.attention.self.value.weight"]
         
-        # Calculate query for new token
-        query = torch.matmul(token_hidden.view(-1, hidden_dim), q_weight.t()).view(
-            batch_size, 1, self.config.num_attention_heads, head_size)
+        # Calculate query, key, value for new token
+        query = torch.matmul(token_hidden.reshape(-1, hidden_dim), q_weight.t()).reshape(
+            batch_size, 1, self.config.num_attention_heads, head_size).permute(0, 2, 1, 3)
         
-        # Calculate key and value for new token
-        key_new = torch.matmul(token_hidden.view(-1, hidden_dim), k_weight.t()).view(
-            batch_size, 1, self.config.num_attention_heads, head_size)
-        value_new = torch.matmul(token_hidden.view(-1, hidden_dim), v_weight.t()).view(
-            batch_size, 1, self.config.num_attention_heads, head_size)
+        key_new = torch.matmul(token_hidden.reshape(-1, hidden_dim), k_weight.t()).reshape(
+            batch_size, 1, self.config.num_attention_heads, head_size).permute(0, 2, 1, 3)
+        
+        value_new = torch.matmul(token_hidden.reshape(-1, hidden_dim), v_weight.t()).reshape(
+            batch_size, 1, self.config.num_attention_heads, head_size).permute(0, 2, 1, 3)
         
         # Update key-value cache
-        if self.kv_cache[layer_idx]["key"] is None:
-            # First token in generation - no cache yet
-            self.kv_cache[layer_idx]["key"] = key_new
-            self.kv_cache[layer_idx]["value"] = value_new
-        else:
-            # Concatenate new k/v with cached k/v
-            self.kv_cache[layer_idx]["key"] = torch.cat(
-                [self.kv_cache[layer_idx]["key"], key_new], dim=1)
-            self.kv_cache[layer_idx]["value"] = torch.cat(
-                [self.kv_cache[layer_idx]["value"], value_new], dim=1)
+        self.kv_cache[layer_idx]["key"] = torch.cat([self.kv_cache[layer_idx]["key"], key_new], dim=2)
+        self.kv_cache[layer_idx]["value"] = torch.cat([self.kv_cache[layer_idx]["value"], value_new], dim=2)
         
-        # Get full key and value tensors from cache
-        key = self.kv_cache[layer_idx]["key"]
+        # Get cached keys and values
+        key = self.kv_cache[layer_idx]["key"]  # (batch, heads, cache_len + 1, head_size)
         value = self.kv_cache[layer_idx]["value"]
         
-        # Transpose for attention calculation
-        query = query.transpose(1, 2)  # (batch, heads, 1, head_size)
-        key = key.transpose(1, 2)      # (batch, heads, seq_len, head_size)
-        value = value.transpose(1, 2)  # (batch, heads, seq_len, head_size)
-        
-        # Attention scores and weights
-        attention_scores = torch.matmul(query, key.transpose(2, 3))  # (batch, heads, 1, seq_len)
+        # Attention calculation
+        attention_scores = torch.matmul(query, key.transpose(2, 3))
         attention_scores = attention_scores / (head_size ** 0.5)
         attention_weights = torch.nn.functional.softmax(attention_scores, dim=-1)
         
         # Apply attention to values
         context = torch.matmul(attention_weights, value)  # (batch, heads, 1, head_size)
-        context = context.transpose(1, 2).contiguous()    # (batch, 1, heads, head_size)
-        context = context.view(batch_size, 1, self.config.hidden_size)
+        context = context.permute(0, 2, 1, 3).reshape(batch_size, 1, hidden_dim)
         
-        # Self-attention output projection
+        # Output projection
         attention_output = torch.matmul(
-            context.view(-1, hidden_dim), 
+            context.reshape(-1, hidden_dim), 
             self.cached_weights[f"layer.{layer_idx}.attention.output.dense.weight"].t()
-        ).view(batch_size, 1, hidden_dim)
+        ).reshape(batch_size, 1, hidden_dim)
         
         # First residual connection and layer norm
         attention_output = attention_output + token_hidden
@@ -563,9 +608,9 @@ class RaspberryLLM:
         
         # Feed-forward network
         intermediate = torch.matmul(
-            attention_output.view(-1, hidden_dim), 
+            attention_output.reshape(-1, hidden_dim), 
             self.cached_weights[f"layer.{layer_idx}.intermediate.dense.weight"].t()
-        ).view(batch_size, 1, -1)
+        ).reshape(batch_size, 1, self.config.intermediate_size)
         
         intermediate = intermediate + self.cached_weights[f"layer.{layer_idx}.intermediate.dense.bias"]
         
@@ -576,9 +621,9 @@ class RaspberryLLM:
         
         # Output projection
         layer_output = torch.matmul(
-            intermediate.view(-1, self.config.intermediate_size), 
+            intermediate.reshape(-1, self.config.intermediate_size), 
             self.cached_weights[f"layer.{layer_idx}.output.dense.weight"].t()
-        ).view(batch_size, 1, hidden_dim)
+        ).reshape(batch_size, 1, hidden_dim)
         
         layer_output = layer_output + self.cached_weights[f"layer.{layer_idx}.output.dense.bias"]
         
@@ -594,41 +639,14 @@ class RaspberryLLM:
         return layer_output
 
 
-# --- Helper functions for tokenization and model preparation ---
-
-def tokenize_text(text: str, vocab: Dict[str, int], max_length: int = 512) -> torch.Tensor:
-    """Simple word-level tokenization"""
-    words = text.split()
-    tokens = []
-    
-    for word in words:
-        if word in vocab:
-            tokens.append(vocab[word])
-        else:
-            # Handle unknown words
-            tokens.append(vocab.get("<unk>", 0))
-    
-    # Truncate if needed
-    if len(tokens) > max_length:
-        tokens = tokens[:max_length]
-    
-    # Convert to tensor and ensure it's 2D (batch_size=1, seq_len)
-    return torch.tensor([tokens], dtype=torch.long)
-
-def detokenize_ids(token_ids: List[int], id_to_token: Dict[int, str]) -> str:
-    """Convert token IDs back to text"""
-    return " ".join([id_to_token.get(id, "<unk>") for id in token_ids])
+# --- Helper functions for model preparation ---
 
 def prepare_model_directory(model_path: str, output_dir: str, num_bits: int = 4):
-    """Prepare model files for efficient loading (simplified)"""
+    """Prepare model files for efficient loading (placeholder)"""
     # This would convert a standard model into our memory-mapped format
     # with proper quantization for Raspberry Pi
-    # For a full implementation, this would:
-    # 1. Load the original model weights
-    # 2. Quantize them to 4 or 8 bits
-    # 3. Save in a memory-mapped friendly format
-    # 4. Save quantization parameters
-    pass
+    print(f"This is a placeholder for model preparation. To actually prepare a model,")
+    print(f"use the quantize_model.py script first to convert your model to {num_bits}-bit format.")
 
 
 # --- Main execution ---
@@ -637,11 +655,11 @@ def main():
     # Model directory (with pre-quantized weights)
     model_dir = "quantized_model"
     
-    # Set quantization bits (8-bit instead of 4-bit for better accuracy)
+    # Set quantization bits (8-bit for better accuracy)
     quantization_bits = 8
     
-    # Set sliding window size (decrease for larger models)
-    sliding_window = 2
+    # Set sliding window size (increase for better coherence, decrease for memory savings)
+    sliding_window = 3
     
     # Initialize model
     print("Initializing RaspberryLLM...")
@@ -649,32 +667,26 @@ def main():
     
     # Example input prompt
     prompt = "In a world where technology"
-    input_ids = tokenize_text(prompt, model.vocab)
     
-    # Generate text with temperature and repetition penalty
-    print(f"Generating from prompt: '{prompt}'")
+    # Generate text
     start_time = time.time()
-    
-    output_ids = model.generate(
-        input_ids,
+    generated_text = model.generate(
+        prompt,
         max_new_tokens=30,
-        temperature=0.8,       # Controls randomness: 0.7-1.0 is a good range
-        repetition_penalty=1.5, # Stronger penalty to reduce repetition: 1.2-1.8 is a good range
-        top_k=40                # Limits to top K tokens: 20-50 is a good range
+        temperature=0.7,        # Slightly lower temperature for more coherent text
+        repetition_penalty=1.5, # Stronger repetition penalty
+        top_k=40                # Limit sampling to top 40 tokens
     )
     
-    # Print generated text and statistics
-    generated_ids = output_ids[0].tolist()[input_ids.shape[1]:]
-    generated_text = detokenize_ids(generated_ids, model.id_to_token)
-    
+    # Print stats
     total_time = time.time() - start_time
-    tokens_per_second = len(generated_ids) / total_time
+    tokens_per_second = 30 / total_time
     
-    print("\nGeneration complete!")
-    print(f"Generated text: {prompt} {generated_text}")
+    print("\nGeneration Summary:")
+    print(f"Full text: {generated_text}")
     print(f"Time taken: {total_time:.2f}s")
     print(f"Generation speed: {tokens_per_second:.2f} tokens/sec")
-    print(f"Memory used: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+
 
 if __name__ == "__main__":
     main()
