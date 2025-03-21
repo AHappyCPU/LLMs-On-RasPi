@@ -16,3 +16,5 @@ Most performant model:
 This repo has the "base" example, which contains many practices that are carried forward into more complex cases. 
 
 Looking to add more cases moving forward, including how to get some of the larger models running. 
+
+To use, clone the repo, then run the download script to download the trial model, the quantize script to prep it, and the raspi_llm script to run it.
