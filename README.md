@@ -13,3 +13,6 @@ Most performant model:
 
 16B Deepseek R1 at 1 token per second (these are considered good numbers). 
 
+This repo has the "base" example, which contains many practices that are carried forward into more complex cases. 
+
+Looking to add more cases moving forward, including how to get some of the larger models running. 
