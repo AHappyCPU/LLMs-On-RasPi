@@ -17,4 +17,4 @@ This repo has the "base" example, which contains many practices that are carried
 
 Looking to add more cases moving forward, including how to get some of the larger models running. 
 
-To use, clone the repo, then run the download script to download the trial model, the quantize script to prep it, and the raspi_llm script to run it.
+To use, clone the repo, then run the download script to download the trial model, the quantize script to prep it, the fix_vocab script if needed, and the raspi_llm script to run it.
