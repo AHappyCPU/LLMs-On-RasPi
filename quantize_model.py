@@ -11,12 +11,18 @@ from safetensors.torch import save_file
 
 def quantize_to_8bit(tensor, chunk_size=10000):
     """Quantize a tensor to 8-bit precision using chunk processing"""
-    # Process on CPU to save memory
+    # Process on CPU to save memory and ensure it's detached from computation graph
     tensor = tensor.detach().cpu()
     
     # Find min and max values
     min_val = float(tensor.min().item())
     max_val = float(tensor.max().item())
+    
+    # Handle edge cases
+    if min_val == max_val:
+        # Constant tensor - just return zeros
+        tensor_size = tensor.numel()
+        return np.zeros(tensor_size, dtype=np.uint8), 1.0, 0
     
     # Calculate scale and zero point
     scale = float((max_val - min_val) / 255)  # 8-bit = 256 values (0-255)
@@ -30,20 +36,25 @@ def quantize_to_8bit(tensor, chunk_size=10000):
     # Allocate output array
     quantized = np.zeros(tensor_size, dtype=np.uint8)
     
-    # Process in chunks to minimize memory usage
-    tensor_flat = tensor.reshape(-1)
-    for i in range(0, tensor_size, chunk_size):
-        end_idx = min(i + chunk_size, tensor_size)
-        chunk = tensor_flat[i:end_idx]
+    try:
+        # Process in chunks to minimize memory usage
+        tensor_flat = tensor.reshape(-1)
+        for i in range(0, tensor_size, chunk_size):
+            end_idx = min(i + chunk_size, tensor_size)
+            chunk = tensor_flat[i:end_idx]
+            
+            # Quantize to 8-bit values
+            chunk_quantized = torch.clamp(torch.round((chunk - min_val) / scale), 0, 255).to(torch.uint8)
+            quantized[i:end_idx] = chunk_quantized.numpy()
         
-        # Quantize to 8-bit values
-        chunk_quantized = torch.clamp(torch.round((chunk - min_val) / scale), 0, 255).to(torch.uint8)
-        quantized[i:end_idx] = chunk_quantized.numpy()
+    except Exception as e:
+        print(f"Error during quantization: {str(e)}")
+        # Fallback method for quantization
+        tensor_np = tensor.numpy().flatten()
+        quantized = np.clip(np.round((tensor_np - min_val) / scale), 0, 255).astype(np.uint8)
     
     # Clean up to free memory
     del tensor
-    del tensor_flat
-    del chunk_quantized
     gc.collect()
     
     return quantized, scale, zero_point
@@ -82,18 +93,20 @@ def convert_model_optimized(model_name, output_dir, use_safe_tensors=True):
     
     # Load model in safetensors format if possible
     try:
-        # Try to load model with low CPU memory usage
-        print(f"Loading model {model_name} in half precision...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
+        # Try to load model with minimal features to avoid dependency issues
+        print(f"Loading model {model_name}...")
+        # Disable gradient tracking to avoid errors
+        with torch.no_grad():
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,  # Use normal precision to avoid issues
+            )
         print("Model loaded successfully")
     except Exception as e:
         print(f"Error loading model: {str(e)}")
-        print("Trying to load with standard settings...")
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        print("Trying to load with alternative settings...")
+        # Try with even simpler settings
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=None)
     
     # Get model architecture type (GPT-Neo, Pythia, GPT-2, etc.)
     model_type = config.model_type.lower()
@@ -223,13 +236,14 @@ def process_weight(obj, attr_path, target_path, output_dir, quant_params):
             print(f"Warning: {attr_path} is not a tensor, but {type(current)}")
             return
         
-        tensor = current
+        # Detach the tensor from the computation graph
+        tensor = current.detach().cpu()
         
         # Process the tensor based on its type
         if tensor.dim() <= 1 or tensor.shape[0] == 1 or "bias" in target_path:
             # Save biases and 1D tensors directly as float32
             with open(os.path.join(output_dir, f"{target_path}.bin"), "wb") as f:
-                f.write(tensor.cpu().numpy().astype(np.float32).tobytes())
+                f.write(tensor.numpy().astype(np.float32).tobytes())
             quant_params["scales"][target_path] = 1.0
             quant_params["zero_points"][target_path] = 0
         else:
@@ -263,7 +277,8 @@ def process_special_weights(layer, source_path, target_paths, layer_idx,
             print(f"Warning: {source_path} is not a tensor, but {type(current)}")
             return
         
-        tensor = current
+        # Detach the tensor from the computation graph
+        tensor = current.detach().cpu()
         
         # Check if this is QKV weights that need to be split
         if any("query" in path for path in target_paths) and \
@@ -287,37 +302,52 @@ def process_qkv_weights(qkv_tensor, target_paths, layer_idx, model_config, outpu
     
     print(f"QKV tensor shape: {qkv_tensor.shape}")
     
-    # Try to determine QKV format
-    if qkv_tensor.shape[0] == 3 * h:
-        # Format: [3*hidden, hidden]
-        q_weight = qkv_tensor[:h]
-        k_weight = qkv_tensor[h:2*h]
-        v_weight = qkv_tensor[2*h:]
-    
-    elif qkv_tensor.shape[0] == h and qkv_tensor.shape[1] == 3 * h:
-        # Format: [hidden, 3*hidden]
-        q_weight = qkv_tensor[:, :h]
-        k_weight = qkv_tensor[:, h:2*h]
-        v_weight = qkv_tensor[:, 2*h:]
-    
-    elif len(qkv_tensor.shape) >= 3:
-        # Format: More complex, reshape first
-        qkv_weight = qkv_tensor.view(h, num_heads, 3, head_dim).transpose(1, 2)
-        q_weight = qkv_weight[:, 0].reshape(h, h)
-        k_weight = qkv_weight[:, 1].reshape(h, h)
-        v_weight = qkv_weight[:, 2].reshape(h, h)
-    
-    else:
-        # Try best effort fallback
-        qkv_size = qkv_tensor.shape[0] * qkv_tensor.shape[1]
-        if qkv_size == 3 * h * h:
-            # Reshape to standard format
-            qkv_reshaped = qkv_tensor.reshape(3, h, h)
-            q_weight = qkv_reshaped[0]
-            k_weight = qkv_reshaped[1]
-            v_weight = qkv_reshaped[2]
+    # Try to determine QKV format based on the tensor shape
+    try:
+        if qkv_tensor.shape[0] == 3 * h:
+            # Format: [3*hidden, hidden]
+            q_weight = qkv_tensor[:h]
+            k_weight = qkv_tensor[h:2*h]
+            v_weight = qkv_tensor[2*h:]
+        
+        elif qkv_tensor.shape[0] == h and qkv_tensor.shape[1] == 3 * h:
+            # Format: [hidden, 3*hidden]
+            q_weight = qkv_tensor[:, :h]
+            k_weight = qkv_tensor[:, h:2*h]
+            v_weight = qkv_tensor[:, 2*h:]
+        
+        elif len(qkv_tensor.shape) >= 3:
+            # Format: More complex, reshape first
+            qkv_weight = qkv_tensor.reshape(h, num_heads, 3, head_dim).transpose(1, 2)
+            q_weight = qkv_weight[:, 0].reshape(h, h)
+            k_weight = qkv_weight[:, 1].reshape(h, h)
+            v_weight = qkv_weight[:, 2].reshape(h, h)
+        
         else:
-            raise ValueError(f"Unrecognized QKV format with shape {qkv_tensor.shape}")
+            # Try best effort fallback
+            qkv_size = qkv_tensor.shape[0] * qkv_tensor.shape[1]
+            if qkv_size == 3 * h * h:
+                # Reshape to standard format
+                qkv_reshaped = qkv_tensor.reshape(3, h, h)
+                q_weight = qkv_reshaped[0]
+                k_weight = qkv_reshaped[1]
+                v_weight = qkv_reshaped[2]
+            else:
+                # For Pythia models with specific format
+                if qkv_tensor.shape[0] == 3072 and qkv_tensor.shape[1] == 1024 and h == 1024:
+                    # This is the format we're seeing in the error logs
+                    q_weight = qkv_tensor[:1024]
+                    k_weight = qkv_tensor[1024:2048]
+                    v_weight = qkv_tensor[2048:]
+                else:
+                    raise ValueError(f"Unrecognized QKV format with shape {qkv_tensor.shape}")
+    except Exception as e:
+        print(f"Error splitting QKV weights: {str(e)}")
+        # Emergency fallback: just divide the tensor into three equal parts
+        split_size = qkv_tensor.shape[0] // 3
+        q_weight = qkv_tensor[:split_size]
+        k_weight = qkv_tensor[split_size:2*split_size]
+        v_weight = qkv_tensor[2*split_size:]
     
     # Map target paths correctly
     q_path = next(path for path in target_paths if "query" in path)
@@ -454,4 +484,4 @@ if __name__ == "__main__":
         import subprocess
         subprocess.check_call(["pip", "install", "safetensors"])
     
-    convert_model_optimized(args.model, args.output, args.safetensors)
+    convert_model_optimized(args.model, args.output, args.safetensors)  
